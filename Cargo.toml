@@ -1,0 +1,23 @@
+[package]
+name = "gentoo-interner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Luca Barbato <lu_zero@gentoo.org>"]
+license = "MIT"
+description = "String interning for Gentoo-related crates"
+repository = "https://github.com/lu-zero/gentoo-interner"
+keywords = ["gentoo", "interner", "string"]
+categories = ["data-structures", "memory-management"]
+
+[dependencies]
+lasso = { version = "0.7", features = ["multi-threaded"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+default = ["interner"]
+interner = ["dep:lasso"]
+
+[profile.release]
+opt-level = 3
+lto = true
