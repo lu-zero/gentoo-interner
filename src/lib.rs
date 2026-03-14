@@ -175,12 +175,6 @@ impl<I: Interner> AsRef<str> for Interned<I> {
     }
 }
 
-impl<I: Interner> std::borrow::Borrow<str> for Interned<I> {
-    fn borrow(&self) -> &str {
-        self.resolve()
-    }
-}
-
 impl<I: Interner> From<&str> for Interned<I> {
     fn from(s: &str) -> Self {
         Self::intern(s)
