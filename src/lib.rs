@@ -192,9 +192,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn test_interned_copy() {
         let a = Interned::<DefaultInterner>::intern("test");
-        let b = a;
+        let b = a.clone();
         assert_eq!(a, b);
     }
 }
