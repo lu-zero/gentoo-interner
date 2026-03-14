@@ -154,6 +154,67 @@ impl<I: Interner> Interned<I> {
     pub fn resolve(&self) -> &str {
         I::resolve(&self.key)
     }
+
+    /// Get the interned string as a `&str`.
+    pub fn as_str(&self) -> &str {
+        self.resolve()
+    }
+}
+
+impl<I: Interner> std::ops::Deref for Interned<I> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.resolve()
+    }
+}
+
+impl<I: Interner> AsRef<str> for Interned<I> {
+    fn as_ref(&self) -> &str {
+        self.resolve()
+    }
+}
+
+impl<I: Interner> std::borrow::Borrow<str> for Interned<I> {
+    fn borrow(&self) -> &str {
+        self.resolve()
+    }
+}
+
+impl<I: Interner> From<&str> for Interned<I> {
+    fn from(s: &str) -> Self {
+        Self::intern(s)
+    }
+}
+
+impl<I: Interner> std::fmt::Display for Interned<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.resolve())
+    }
+}
+
+impl<I: Interner> PartialEq<str> for Interned<I> {
+    fn eq(&self, other: &str) -> bool {
+        self.resolve() == other
+    }
+}
+
+impl<I: Interner> PartialEq<&str> for Interned<I> {
+    fn eq(&self, other: &&str) -> bool {
+        self.resolve() == *other
+    }
+}
+
+impl<I: Interner> PartialEq<Interned<I>> for str {
+    fn eq(&self, other: &Interned<I>) -> bool {
+        self == other.resolve()
+    }
+}
+
+impl<I: Interner> PartialEq<Interned<I>> for &str {
+    fn eq(&self, other: &Interned<I>) -> bool {
+        *self == other.resolve()
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -179,6 +240,7 @@ mod tests {
     fn test_interned_basic() {
         let a = Interned::<DefaultInterner>::intern("test");
         assert_eq!(a.resolve(), "test");
+        assert_eq!(a.as_str(), "test");
     }
 
     #[test]
@@ -192,10 +254,44 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::clone_on_copy)]
     fn test_interned_copy() {
         let a = Interned::<DefaultInterner>::intern("test");
+        #[allow(clippy::clone_on_copy)]
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_interned_from_str() {
+        let a: Interned<DefaultInterner> = "hello".into();
+        assert_eq!(a.as_str(), "hello");
+    }
+
+    #[test]
+    fn test_interned_deref() {
+        let a = Interned::<DefaultInterner>::intern("test");
+        assert!(a.starts_with("te"));
+        assert!(a.ends_with("st"));
+    }
+
+    #[test]
+    fn test_interned_as_ref() {
+        let a = Interned::<DefaultInterner>::intern("test");
+        let s: &str = a.as_ref();
+        assert_eq!(s, "test");
+    }
+
+    #[test]
+    fn test_interned_display() {
+        let a = Interned::<DefaultInterner>::intern("test");
+        assert_eq!(format!("{}", a), "test");
+    }
+
+    #[test]
+    fn test_interned_str_eq() {
+        let a = Interned::<DefaultInterner>::intern("test");
+        assert_eq!(a, "test");
+        assert_eq!("test", a);
+        assert_ne!(a, "other");
     }
 }
