@@ -13,8 +13,9 @@
 //!
 //! | Feature | DefaultInterner | Key Type | Behavior |
 //! |---------|-----------------|----------|----------|
-//! | `interner` (default) | `GlobalInterner` | `u32` | Process-global deduplication, `Copy` |
-//! | no `interner` | `NoInterner` | `Box<str>` | No deduplication, `Clone` only |
+//! | `interner` (default) | `GlobalInterner` | `u32` | papaya-backed, lock-free, `Copy` |
+//! | `lasso` | `GlobalInterner` | `u32` | lasso-backed, arena alloc, `Copy` |
+//! | neither | `NoInterner` | `Box<str>` | No deduplication, `Clone` only |
 //!
 //! # Example
 //!
@@ -33,7 +34,7 @@ use std::marker::PhantomData;
 /// Implementations map strings to keys and resolve keys back to strings.
 /// All methods are static, allowing the interner type to serve as a
 /// configuration parameter without carrying runtime state.
-pub trait Interner: Send + Sync + 'static {
+pub trait Interner: Clone + Send + Sync + 'static {
     /// Key type returned by [`get_or_intern`](Self::get_or_intern).
     type Key: Clone + Eq + std::hash::Hash + Send + Sync + 'static + Debug;
 
@@ -63,45 +64,123 @@ impl Interner for NoInterner {
     }
 }
 
-/// Global process-wide [`Interner`] backed by `lasso::ThreadedRodeo`.
+/// Global process-wide interner. Zero-sized type; all state lives in a
+/// process-wide static. Keys are stable `u32` values, making
+/// `Interned<GlobalInterner>` `Copy`.
 ///
-/// Zero-sized type; all state lives in a process-wide static.
-/// Keys are stable `u32` values, making `Interned<GlobalInterner>` `Copy`.
-#[cfg(feature = "interner")]
+/// The backing store is selected by feature flags:
+/// - `interner` (default): two lock-free [`papaya::HashMap`]s; strings are
+///   leaked on first intern so `resolve` needs no guard.
+/// - `lasso`: [`lasso::ThreadedRodeo`] arena; enable for benchmarking.
+#[cfg(any(feature = "interner", feature = "lasso"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlobalInterner;
 
-#[cfg(feature = "interner")]
-static GLOBAL: std::sync::OnceLock<lasso::ThreadedRodeo> = std::sync::OnceLock::new();
+// ── papaya backend ────────────────────────────────────────────────────────────
 
-#[cfg(feature = "interner")]
-fn global() -> &'static lasso::ThreadedRodeo {
-    GLOBAL.get_or_init(lasso::ThreadedRodeo::default)
+#[cfg(all(feature = "interner", not(feature = "lasso")))]
+struct GlobalState {
+    /// `str` → id. Keys are leaked so they are `'static` and can be looked
+    /// up by `&str` via the `Borrow<str>` impl on `&'static str`.
+    forward: papaya::HashMap<&'static str, u32>,
+    /// id → `'static` str pointer (copied straight out, no guard needed).
+    reverse: papaya::HashMap<u32, &'static str>,
+    counter: std::sync::atomic::AtomicU32,
 }
 
-#[cfg(feature = "interner")]
+#[cfg(all(feature = "interner", not(feature = "lasso")))]
+static GLOBAL: std::sync::OnceLock<GlobalState> = std::sync::OnceLock::new();
+
+#[cfg(all(feature = "interner", not(feature = "lasso")))]
+fn global() -> &'static GlobalState {
+    GLOBAL.get_or_init(|| GlobalState {
+        forward: papaya::HashMap::new(),
+        reverse: papaya::HashMap::new(),
+        counter: std::sync::atomic::AtomicU32::new(0),
+    })
+}
+
+#[cfg(all(feature = "interner", not(feature = "lasso")))]
+impl Interner for GlobalInterner {
+    type Key = u32;
+
+    fn get_or_intern(s: &str) -> u32 {
+        use std::sync::atomic::Ordering;
+        let state = global();
+        let pinned = state.forward.pin();
+
+        // Fast path: already interned — fully lock-free.
+        if let Some(&id) = pinned.get(s) {
+            return id;
+        }
+
+        // Slow path: new string. Leak it to obtain a `'static` pointer
+        // for both the forward key and the reverse value.
+        //
+        // The reverse insert is done *inside* the closure so it completes
+        // before the forward entry's CAS makes the id visible to other
+        // threads. Any thread that reads id N from the forward map is
+        // guaranteed to find reverse[N] already present.
+        //
+        // Under concurrent races for the same new string, the losing thread's
+        // closure may also have run, leaving an orphaned counter slot and a
+        // leaked string copy — bounded and harmless for a process-lifetime
+        // interner.
+        let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+        *pinned.get_or_insert_with(leaked, || {
+            let id = state.counter.fetch_add(1, Ordering::Relaxed);
+            state.reverse.pin().insert(id, leaked);
+            id
+        })
+    }
+
+    fn resolve(key: &u32) -> &str {
+        // Values are `&'static str` so we can copy the pointer straight out
+        // without retaining a guard.
+        global()
+            .reverse
+            .pin()
+            .get(key)
+            .copied()
+            .expect("invalid interner key")
+    }
+}
+
+// ── lasso backend ─────────────────────────────────────────────────────────────
+
+#[cfg(feature = "lasso")]
+static GLOBAL_LASSO: std::sync::OnceLock<lasso::ThreadedRodeo> = std::sync::OnceLock::new();
+
+#[cfg(feature = "lasso")]
+fn global_lasso() -> &'static lasso::ThreadedRodeo {
+    GLOBAL_LASSO.get_or_init(lasso::ThreadedRodeo::default)
+}
+
+#[cfg(feature = "lasso")]
 impl Interner for GlobalInterner {
     type Key = u32;
 
     fn get_or_intern(s: &str) -> u32 {
         use lasso::Key as _;
-        global().get_or_intern(s).into_usize() as u32
+        global_lasso().get_or_intern(s).into_usize() as u32
     }
 
     fn resolve(key: &u32) -> &str {
         use lasso::Key as _;
         let spur = lasso::Spur::try_from_usize(*key as usize).expect("invalid interner key");
-        global().resolve(&spur)
+        global_lasso().resolve(&spur)
     }
 }
 
-/// Default interner type based on feature configuration.
+// ── DefaultInterner selection ─────────────────────────────────────────────────
+
+/// Default interner type based on feature flags.
 ///
-/// - With `interner` feature (default): [`GlobalInterner`]
-/// - Without `interner` feature: [`NoInterner`]
-#[cfg(feature = "interner")]
+/// - `interner` (default) or `lasso`: [`GlobalInterner`] — process-global, `Copy` keys
+/// - neither: [`NoInterner`] — no deduplication, `Clone` only
+#[cfg(any(feature = "interner", feature = "lasso"))]
 pub type DefaultInterner = GlobalInterner;
-#[cfg(not(feature = "interner"))]
+#[cfg(not(any(feature = "interner", feature = "lasso")))]
 pub type DefaultInterner = NoInterner;
 
 /// An interned string key parameterized by [`Interner`] type `I`.
