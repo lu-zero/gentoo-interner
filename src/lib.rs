@@ -71,7 +71,7 @@ impl Interner for NoInterner {
 /// The backing store is selected by feature flags:
 /// - `interner` (default): two lock-free [`papaya::HashMap`]s; strings are
 ///   leaked on first intern so `resolve` needs no guard.
-/// - `lasso`: [`lasso::ThreadedRodeo`] arena; enable for benchmarking.
+/// - `lasso`: `lasso::ThreadedRodeo` arena; enable for benchmarking.
 #[cfg(any(feature = "interner", feature = "lasso"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlobalInterner;

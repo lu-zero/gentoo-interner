@@ -8,7 +8,8 @@ String interning for Gentoo-related Rust crates.
 
 ## Features
 
-- Process-wide deduplication via `lasso` (default)
+- Process-wide deduplication via `papaya` lock-free hashmaps (default)
+- Optional `lasso` arena-backed backend for benchmarking
 - `Box<str>` fallback when interning disabled
 - Optional serde support
 - `Copy` types with global interner (4 bytes)
@@ -17,7 +18,7 @@ String interning for Gentoo-related Rust crates.
 
 ```toml
 [dependencies]
-gentoo-interner = "0.1"
+gentoo-interner = "0.2"
 ```
 
 ## Usage
@@ -36,8 +37,15 @@ assert_eq!(a, b); // Same key, cheap equality
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `interner` | Yes | Global interning via `lasso` |
+| `interner` | Yes | Global interning via `papaya` (lock-free) |
+| `lasso` | No | Alternative `lasso` arena backend (for benchmarking) |
 | `serde` | No | Serde serialization |
+
+## Breaking changes in 0.2
+
+- `Interner` trait now requires `Clone` as a supertrait.
+- Default `GlobalInterner` backend switched from `lasso` to `papaya`.
+  Enable `--features lasso` to restore the old backend.
 
 ## License
 
