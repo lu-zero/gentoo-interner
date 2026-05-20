@@ -69,23 +69,55 @@ impl Interner for NoInterner {
 /// `Interned<GlobalInterner>` `Copy`.
 ///
 /// The backing store is selected by feature flags:
-/// - `interner` (default): two lock-free [`papaya::HashMap`]s; strings are
-///   leaked on first intern so `resolve` needs no guard.
+/// - `interner` (default): lock-free [`papaya::HashMap`] for lookups +
+///   [`boxcar::Vec`] for indexed `resolve`, with a global `Mutex` gating
+///   inserts so the slow path never wastes allocations on races.
 /// - `lasso`: `lasso::ThreadedRodeo` arena; enable for benchmarking.
 #[cfg(any(feature = "interner", feature = "lasso"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlobalInterner;
 
 // ── papaya backend ────────────────────────────────────────────────────────────
+//
+//  * Fast path: lock-free `papaya` `get`, no allocation.
+//  * Slow path: sharded mutexes (mirror `lasso::ThreadedRodeo`). The
+//    string's hash picks one of `N_SHARDS` mutexes; only threads colliding
+//    on the same shard contend. Inside the lock we re-check (a lock-free
+//    reader may have missed us on the fast path), then allocate + push to
+//    the reverse vec + use papaya's cheap `insert()`. This avoids the
+//    `get_or_insert_with()` overhead while still scaling across threads.
+//  * Resolve: O(1) indexed read into a `boxcar::Vec<&'static str>`; no
+//    `.pin()` or hash lookup per call.
+//
+// Known non-failures:
+//  * If a thread panics between `reverse.push` and `forward.insert`, the
+//    reverse vec keeps an orphan slot — a leaked string that no forward
+//    entry refers to. The next intern of the same string allocates a
+//    fresh slot. This wastes memory but does not corrupt state. Lasso has
+//    the analogous window between `strings.insert` and the forward
+//    `insert_in_slot`.
+
+#[cfg(all(feature = "interner", not(feature = "lasso")))]
+const N_SHARDS: usize = 32;
+
+// Bitmask sharding (`& (N_SHARDS - 1)`) requires a power of two.
+#[cfg(all(feature = "interner", not(feature = "lasso")))]
+const _: () = assert!(
+    N_SHARDS.is_power_of_two(),
+    "N_SHARDS must be a power of two for bitmask sharding to be correct",
+);
 
 #[cfg(all(feature = "interner", not(feature = "lasso")))]
 struct GlobalState {
-    /// `str` → id. Keys are leaked so they are `'static` and can be looked
-    /// up by `&str` via the `Borrow<str>` impl on `&'static str`.
+    /// `str` → id. Keys are leaked so they are `'static`; lookups by
+    /// `&str` work via the `Borrow<str>` impl on `&'static str`.
     forward: papaya::HashMap<&'static str, u32>,
-    /// id → `'static` str pointer (copied straight out, no guard needed).
-    reverse: papaya::HashMap<u32, &'static str>,
-    counter: std::sync::atomic::AtomicU32,
+    /// id → `'static` str. Indexed Vec — `resolve` is `reverse[id]`.
+    reverse: boxcar::Vec<&'static str>,
+    /// One mutex per shard. The string's hash selects the shard so threads
+    /// colliding on the same shard serialize; everyone else proceeds in
+    /// parallel. Cache-line padded to avoid false sharing.
+    insert_shards: [parking_lot::Mutex<()>; N_SHARDS],
 }
 
 #[cfg(all(feature = "interner", not(feature = "lasso")))]
@@ -95,9 +127,20 @@ static GLOBAL: std::sync::OnceLock<GlobalState> = std::sync::OnceLock::new();
 fn global() -> &'static GlobalState {
     GLOBAL.get_or_init(|| GlobalState {
         forward: papaya::HashMap::new(),
-        reverse: papaya::HashMap::new(),
-        counter: std::sync::atomic::AtomicU32::new(0),
+        reverse: boxcar::Vec::new(),
+        insert_shards: std::array::from_fn(|_| parking_lot::Mutex::new(())),
     })
+}
+
+#[cfg(all(feature = "interner", not(feature = "lasso")))]
+fn shard_for(s: &str) -> usize {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    use std::sync::OnceLock;
+    // Process-stable hasher so shard assignment is consistent.
+    static HASHER: OnceLock<RandomState> = OnceLock::new();
+    let hasher = HASHER.get_or_init(RandomState::new);
+    (hasher.hash_one(s) as usize) & (N_SHARDS - 1)
 }
 
 #[cfg(all(feature = "interner", not(feature = "lasso")))]
@@ -105,42 +148,36 @@ impl Interner for GlobalInterner {
     type Key = u32;
 
     fn get_or_intern(s: &str) -> u32 {
-        use std::sync::atomic::Ordering;
         let state = global();
-        let pinned = state.forward.pin();
 
-        // Fast path: already interned — fully lock-free.
-        if let Some(&id) = pinned.get(s) {
+        // Fast path: lock-free read.
+        if let Some(&id) = state.forward.pin().get(s) {
             return id;
         }
 
-        // Slow path: new string. Leak it to obtain a `'static` pointer
-        // for both the forward key and the reverse value.
-        //
-        // The reverse insert is done *inside* the closure so it completes
-        // before the forward entry's CAS makes the id visible to other
-        // threads. Any thread that reads id N from the forward map is
-        // guaranteed to find reverse[N] already present.
-        //
-        // Under concurrent races for the same new string, the losing thread's
-        // closure may also have run, leaving an orphaned counter slot and a
-        // leaked string copy — bounded and harmless for a process-lifetime
-        // interner.
+        // Slow path: lock just the shard this string hashes to.
+        let shard = shard_for(s);
+        let _guard = state.insert_shards[shard].lock();
+        let pinned = state.forward.pin();
+        if let Some(&id) = pinned.get(s) {
+            return id;
+        }
         let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
-        *pinned.get_or_insert_with(leaked, || {
-            let id = state.counter.fetch_add(1, Ordering::Relaxed);
-            state.reverse.pin().insert(id, leaked);
-            id
-        })
+        let idx = state.reverse.push(leaked);
+        // The forward map stores u32 ids; truncating here would associate the
+        // new string with a stale id and silently corrupt later resolves.
+        // Lasso handles the analogous overflow with `KeySpaceExhaustion`;
+        // we panic since our trait doesn't surface an error path.
+        let id = u32::try_from(idx)
+            .expect("gentoo-interner: id space exhausted (more than u32::MAX unique strings)");
+        pinned.insert(leaked, id);
+        id
     }
 
     fn resolve(key: &u32) -> &str {
-        // Values are `&'static str` so we can copy the pointer straight out
-        // without retaining a guard.
         global()
             .reverse
-            .pin()
-            .get(key)
+            .get(*key as usize)
             .copied()
             .expect("invalid interner key")
     }
