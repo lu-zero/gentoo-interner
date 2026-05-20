@@ -73,7 +73,7 @@ impl Interner for NoInterner {
 ///   [`boxcar::Vec`] for indexed `resolve`, with a global `Mutex` gating
 ///   inserts so the slow path never wastes allocations on races.
 /// - `lasso`: `lasso::ThreadedRodeo` arena; enable for benchmarking.
-#[cfg(any(feature = "interner", feature = "lasso"))]
+#[cfg(any(feature = "interner", feature = "lasso", feature = "symbol-table"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlobalInterner;
 
@@ -97,17 +97,29 @@ pub struct GlobalInterner;
 //    the analogous window between `strings.insert` and the forward
 //    `insert_in_slot`.
 
-#[cfg(all(feature = "interner", not(feature = "lasso")))]
+#[cfg(all(
+    feature = "interner",
+    not(feature = "lasso"),
+    not(feature = "symbol-table")
+))]
 const N_SHARDS: usize = 32;
 
 // Bitmask sharding (`& (N_SHARDS - 1)`) requires a power of two.
-#[cfg(all(feature = "interner", not(feature = "lasso")))]
+#[cfg(all(
+    feature = "interner",
+    not(feature = "lasso"),
+    not(feature = "symbol-table")
+))]
 const _: () = assert!(
     N_SHARDS.is_power_of_two(),
     "N_SHARDS must be a power of two for bitmask sharding to be correct",
 );
 
-#[cfg(all(feature = "interner", not(feature = "lasso")))]
+#[cfg(all(
+    feature = "interner",
+    not(feature = "lasso"),
+    not(feature = "symbol-table")
+))]
 struct GlobalState {
     /// `str` → id. Keys are leaked so they are `'static`; lookups by
     /// `&str` work via the `Borrow<str>` impl on `&'static str`.
@@ -120,10 +132,18 @@ struct GlobalState {
     insert_shards: [parking_lot::Mutex<()>; N_SHARDS],
 }
 
-#[cfg(all(feature = "interner", not(feature = "lasso")))]
+#[cfg(all(
+    feature = "interner",
+    not(feature = "lasso"),
+    not(feature = "symbol-table")
+))]
 static GLOBAL: std::sync::OnceLock<GlobalState> = std::sync::OnceLock::new();
 
-#[cfg(all(feature = "interner", not(feature = "lasso")))]
+#[cfg(all(
+    feature = "interner",
+    not(feature = "lasso"),
+    not(feature = "symbol-table")
+))]
 fn global() -> &'static GlobalState {
     GLOBAL.get_or_init(|| GlobalState {
         forward: papaya::HashMap::new(),
@@ -132,7 +152,11 @@ fn global() -> &'static GlobalState {
     })
 }
 
-#[cfg(all(feature = "interner", not(feature = "lasso")))]
+#[cfg(all(
+    feature = "interner",
+    not(feature = "lasso"),
+    not(feature = "symbol-table")
+))]
 fn shard_for(s: &str) -> usize {
     use std::collections::hash_map::RandomState;
     use std::hash::BuildHasher;
@@ -143,7 +167,11 @@ fn shard_for(s: &str) -> usize {
     (hasher.hash_one(s) as usize) & (N_SHARDS - 1)
 }
 
-#[cfg(all(feature = "interner", not(feature = "lasso")))]
+#[cfg(all(
+    feature = "interner",
+    not(feature = "lasso"),
+    not(feature = "symbol-table")
+))]
 impl Interner for GlobalInterner {
     type Key = u32;
 
@@ -183,6 +211,28 @@ impl Interner for GlobalInterner {
     }
 }
 
+// ── symbol-table backend ──────────────────────────────────────────────────────
+//
+// `symbol_table::GlobalSymbol` is a process-wide interner backed by a
+// sharded `SymbolTable` (16 shards by default). Each shard holds a
+// `Mutex<HashMap>` and an arena allocator for the strings.
+
+#[cfg(all(feature = "symbol-table", not(feature = "lasso")))]
+impl Interner for GlobalInterner {
+    type Key = u32;
+
+    fn get_or_intern(s: &str) -> u32 {
+        std::num::NonZeroU32::from(symbol_table::GlobalSymbol::from(s)).get()
+    }
+
+    fn resolve(key: &u32) -> &str {
+        let sym = symbol_table::GlobalSymbol::from(
+            std::num::NonZeroU32::new(*key).expect("invalid interner key (zero)"),
+        );
+        sym.as_str()
+    }
+}
+
 // ── lasso backend ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "lasso")]
@@ -215,9 +265,9 @@ impl Interner for GlobalInterner {
 ///
 /// - `interner` (default) or `lasso`: [`GlobalInterner`] — process-global, `Copy` keys
 /// - neither: [`NoInterner`] — no deduplication, `Clone` only
-#[cfg(any(feature = "interner", feature = "lasso"))]
+#[cfg(any(feature = "interner", feature = "lasso", feature = "symbol-table"))]
 pub type DefaultInterner = GlobalInterner;
-#[cfg(not(any(feature = "interner", feature = "lasso")))]
+#[cfg(not(any(feature = "interner", feature = "lasso", feature = "symbol-table")))]
 pub type DefaultInterner = NoInterner;
 
 /// An interned string key parameterized by [`Interner`] type `I`.
