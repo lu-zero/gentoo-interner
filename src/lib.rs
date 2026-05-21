@@ -454,4 +454,99 @@ mod tests {
         assert_eq!("test", a);
         assert_ne!(a, "other");
     }
+
+    /// Roundtrip stress test: intern many unique strings, resolve them
+    /// all back, verify every one round-trips. Runs across every backend
+    /// since it uses `DefaultInterner`.
+    #[test]
+    fn test_roundtrip_many() {
+        // Use a salted prefix so concurrent tests don't collide with
+        // strings interned by other tests (the global interner is shared).
+        let prefix = format!("rt_many_{}_", std::process::id());
+        let strings: Vec<String> = (0..1024).map(|i| format!("{prefix}{i:08}")).collect();
+        let keys: Vec<Interned<DefaultInterner>> =
+            strings.iter().map(|s| Interned::intern(s)).collect();
+        for (k, s) in keys.iter().zip(strings.iter()) {
+            assert_eq!(k.as_str(), s, "roundtrip failed for {s}");
+        }
+    }
+
+    /// Same string interned multiple times must always yield the same key,
+    /// regardless of interleaving with other interns.
+    #[test]
+    fn test_intern_stable() {
+        let s = format!("stable_{}", std::process::id());
+        let first = Interned::<DefaultInterner>::intern(&s);
+        for _ in 0..100 {
+            Interned::<DefaultInterner>::intern(&format!("noise_{}", rand_like()));
+            let again = Interned::<DefaultInterner>::intern(&s);
+            assert_eq!(first, again, "intern of {s} was not stable");
+        }
+    }
+
+    /// Multi-threaded roundtrip: many threads each intern a private set
+    /// of strings and a shared set. All resolves must round-trip and the
+    /// shared strings must produce the same key across threads.
+    #[test]
+    fn test_concurrent_roundtrip() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let n_threads = 8;
+        let n_private = 256;
+        let pid = std::process::id();
+
+        // Shared strings every thread interns
+        let shared: Vec<String> = (0..32)
+            .map(|i| format!("ct_shared_{pid}_{i}"))
+            .collect();
+        let shared = Arc::new(shared);
+
+        // Reference keys interned from the main thread first
+        let shared_keys: Vec<Interned<DefaultInterner>> =
+            shared.iter().map(|s| Interned::intern(s)).collect();
+        let shared_keys = Arc::new(shared_keys);
+
+        let handles: Vec<_> = (0..n_threads)
+            .map(|t| {
+                let shared = Arc::clone(&shared);
+                let shared_keys = Arc::clone(&shared_keys);
+                thread::spawn(move || {
+                    // Private strings for this thread
+                    let private: Vec<String> = (0..n_private)
+                        .map(|i| format!("ct_priv_{pid}_t{t}_{i:08}"))
+                        .collect();
+                    let private_keys: Vec<Interned<DefaultInterner>> = private
+                        .iter()
+                        .map(|s| Interned::intern(s))
+                        .collect();
+                    // Private roundtrip
+                    for (k, s) in private_keys.iter().zip(private.iter()) {
+                        assert_eq!(k.as_str(), s);
+                    }
+                    // Shared keys should match the main-thread reference
+                    for s in shared.iter() {
+                        let k = Interned::<DefaultInterner>::intern(s);
+                        let expected = shared_keys
+                            .iter()
+                            .find(|sk| sk.as_str() == s)
+                            .copied()
+                            .expect("shared key not found");
+                        assert_eq!(k, expected, "thread {t} got mismatched key for {s}");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread panic");
+        }
+    }
+
+    /// Cheap pseudo-random helper for `test_intern_stable` noise — no
+    /// dependency on `rand`.
+    fn rand_like() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
 }
