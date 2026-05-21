@@ -116,7 +116,18 @@ below). The second is still pending.
 ## Confirmed result: mimalloc closes the gap
 
 Re-ran the same firefox resolve bench across a 3×2 matrix of
-backends × allocators (glibc 2.x default vs. mimalloc 0.1.51):
+backends × allocators (glibc 2.x default vs. mimalloc 0.1.51).
+
+The first matrix below was measured with the original
+`iter_with_setup` bench shape, which rebuilt the provider
+before every iteration. Criterion correctly excluded setup
+time from the reported mean, but the wall-clock samples behind
+those numbers were dominated by provider construction, not the
+actual resolve work. We later corrected the bench to build the
+provider once and use `iter()`; both matrices are kept here
+because they tell different (both useful) stories.
+
+### Old shape — setup folded into the wall-clock pattern
 
 | backend       | glibc    | mimalloc | mimalloc speedup |
 |---------------|---------:|---------:|-----------------:|
@@ -124,24 +135,56 @@ backends × allocators (glibc 2.x default vs. mimalloc 0.1.51):
 | lasso         |   199 ms |  78.8 ms |            2.53× |
 | symbol-table  |   184 ms |  81.0 ms |            2.27× |
 
+### Resolve routine only — provider built once, `iter()`
+
+| backend       | glibc    | mimalloc | mimalloc speedup |
+|---------------|---------:|---------:|-----------------:|
+| papaya        |  30.5 ms |  22.3 ms |            1.37× |
+| lasso         |  31.8 ms |  23.2 ms |            1.37× |
+| symbol-table  |  33.3 ms |  22.9 ms |            1.45× |
+
+The split clarifies which phase each variable affects:
+
+- **Setup vs. resolve are very different workloads.**
+  Provider construction is allocation-heavy (cloning the repo,
+  building hashmaps, running convert::convert_deps for every
+  CPV). Resolve is dominated by pubgrub's solver internals
+  (`unit_propagation`, `Incompatibility::relation`,
+  `Version::cmp`, version range arithmetic).
+
+- **Allocator gain is mostly on setup.** The 2.3× speedup we
+  attributed to mimalloc was ~2× on the setup path; the resolve
+  routine itself only gets ~1.4× from the allocator switch.
+
+- **Backend ranking flips between phases.** Lasso looks
+  slightly faster when setup is included, because its backend
+  produces better cache locality during the heavy
+  build_provider walk. Papaya is slightly faster on the resolve
+  routine because its lock-free `get()` is cheaper than
+  DashMap's shard lock under read-heavy access. Symbol-table
+  loses on both phases on glibc but ties on mimalloc.
+
+- **Differences are noise-level once mimalloc is in.** All
+  three backends land within 4% on mimalloc in both phases.
+  Pick on soundness/API ergonomics, not on these numbers.
+
 What this tells us:
 
-1. **The 12-18% backend gap is a glibc artifact.** On mimalloc
+1. **The 12-18% backend gap was a glibc artifact.** On mimalloc
    all three backends land within 4% of each other, with
    noise-level differences. The "lasso wins" effect we
    originally documented was the glibc free-list reacting
-   differently to each backend's allocation pattern, not
-   anything about the interner's hot path.
+   differently to each backend's allocation pattern during
+   provider construction, not anything about the interner's
+   hot path.
 
-2. **mimalloc gives a ~2.3-2.5× wall-clock speedup on the
-   solver workload.** That's an order of magnitude larger than
-   any inter-backend difference ever was. Allocator choice
-   matters far more than interner choice for this workload.
+2. **Allocator choice dominates.** The 2.3× setup speedup and
+   1.4× routine speedup from mimalloc are larger than any
+   inter-backend difference observed.
 
-3. **Backend ranking inverts.** On glibc, symbol-table is
-   marginally fastest. On mimalloc, lasso is marginally
-   fastest. The differences are inside the noise floor —
-   neither ordering is meaningful in isolation.
+3. **Backend rankings move between phases.** See the table
+   note above — different phases stress different parts of the
+   interner. No single "winner" survives the split.
 
 On the regen workload (portage-repo full-tree, j=20), the
 allocator effect is smaller but in the same direction:
@@ -160,16 +203,20 @@ tradeoff for arena-style allocation.
 ### Operational takeaways
 
 - **Default to mimalloc** for solver-driven binaries (`em`,
-  any future portage-resolver tool). The 2.3× speedup pays
-  for itself; the doubled RSS is a non-issue at our absolute
-  numbers (under 500 MB on a 70k-ebuild tree).
-- **Don't pick a backend on perf grounds.** Papaya, lasso,
-  symbol-table all tie on mimalloc; pick on soundness/API
+  any future portage-resolver tool). The combined setup +
+  resolve speedup pays for itself; the doubled RSS is a
+  non-issue at our absolute numbers (under 500 MB on a
+  70k-ebuild tree).
+- **Don't pick a backend on perf grounds.** All three tie on
+  mimalloc; the small glibc differences favour different
+  backends in different phases. Pick on soundness/API
   ergonomics, not microbench numbers.
-- **The `Vec::clone` hotspot in `provider::new` is still
-  worth cleaning up** — not for the closed gap, but because
-  it's a code smell in its own right. Now ~7 ms on an 80 ms
-  budget rather than ~18 ms on a 200 ms budget.
+- **Resolve-routine hot spots are mostly outside our code.**
+  After the `iter()` switch, ~25% of routine time is in
+  pubgrub's own solver loop (`unit_propagation`,
+  `Incompatibility::relation`, version-range arithmetic).
+  Our `prioritize` and `choose_version` together account for
+  about 5%. Allocation pressure during the routine is ~7%.
 
 ## What this *does not* mean
 
