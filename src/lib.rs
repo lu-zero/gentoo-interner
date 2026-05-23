@@ -36,7 +36,7 @@ use std::marker::PhantomData;
 /// configuration parameter without carrying runtime state.
 pub trait Interner: Clone + Send + Sync + 'static {
     /// Key type returned by [`get_or_intern`](Self::get_or_intern).
-    type Key: Clone + Eq + std::hash::Hash + Send + Sync + 'static + Debug;
+    type Key: Clone + Eq + Ord + std::hash::Hash + Send + Sync + 'static + Debug;
 
     /// Intern `s`, returning a stable key.
     fn get_or_intern(s: &str) -> Self::Key;
@@ -304,6 +304,16 @@ impl<I: Interner> PartialEq for Interned<I> {
     }
 }
 impl<I: Interner> Eq for Interned<I> {}
+impl<I: Interner> PartialOrd for Interned<I> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<I: Interner> Ord for Interned<I> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
 impl<I: Interner> std::hash::Hash for Interned<I> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.key.hash(state);
@@ -352,6 +362,12 @@ impl<I: Interner> AsRef<str> for Interned<I> {
 impl<I: Interner> From<&str> for Interned<I> {
     fn from(s: &str) -> Self {
         Self::intern(s)
+    }
+}
+
+impl<I: Interner> From<String> for Interned<I> {
+    fn from(s: String) -> Self {
+        Self::intern(&s)
     }
 }
 
