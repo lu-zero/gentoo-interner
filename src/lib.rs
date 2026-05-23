@@ -77,193 +77,121 @@ impl Interner for NoInterner {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlobalInterner;
 
-// ── papaya backend ────────────────────────────────────────────────────────────
+// ── Backend implementations ────────────────────────────────────────────────────
 //
-//  * Fast path: lock-free `papaya` `get`, no allocation.
-//  * Slow path: sharded mutexes (mirror `lasso::ThreadedRodeo`). The
-//    string's hash picks one of `N_SHARDS` mutexes; only threads colliding
-//    on the same shard contend. Inside the lock we re-check (a lock-free
-//    reader may have missed us on the fast path), then allocate + push to
-//    the reverse vec + use papaya's cheap `insert()`. This avoids the
-//    `get_or_insert_with()` overhead while still scaling across threads.
-//  * Resolve: O(1) indexed read into a `boxcar::Vec<&'static str>`; no
-//    `.pin()` or hash lookup per call.
-//
-// Known non-failures:
-//  * If a thread panics between `reverse.push` and `forward.insert`, the
-//    reverse vec keeps an orphan slot — a leaked string that no forward
-//    entry refers to. The next intern of the same string allocates a
-//    fresh slot. This wastes memory but does not corrupt state. Lasso has
-//    the analogous window between `strings.insert` and the forward
-//    `insert_in_slot`.
+// Precedence: lasso > symbol-table > interner (papaya).
+// The cfg_if! block ensures exactly one backend is compiled.
 
-#[cfg(all(
-    feature = "interner",
-    not(feature = "lasso"),
-    not(feature = "symbol-table")
-))]
-const N_SHARDS: usize = 32;
+cfg_if::cfg_if! {
+    if #[cfg(feature = "lasso")] {
+        static GLOBAL_LASSO: std::sync::OnceLock<lasso::ThreadedRodeo> = std::sync::OnceLock::new();
 
-// Bitmask sharding (`& (N_SHARDS - 1)`) requires a power of two.
-#[cfg(all(
-    feature = "interner",
-    not(feature = "lasso"),
-    not(feature = "symbol-table")
-))]
-const _: () = assert!(
-    N_SHARDS.is_power_of_two(),
-    "N_SHARDS must be a power of two for bitmask sharding to be correct",
-);
-
-#[cfg(all(
-    feature = "interner",
-    not(feature = "lasso"),
-    not(feature = "symbol-table")
-))]
-#[repr(align(64))]
-struct PaddedMutex(parking_lot::Mutex<()>);
-
-#[cfg(all(
-    feature = "interner",
-    not(feature = "lasso"),
-    not(feature = "symbol-table")
-))]
-struct GlobalState {
-    /// `str` → id. Keys are leaked so they are `'static`; lookups by
-    /// `&str` work via the `Borrow<str>` impl on `&'static str`.
-    forward: papaya::HashMap<&'static str, u32>,
-    /// id → `'static` str. Indexed Vec — `resolve` is `reverse[id]`.
-    reverse: boxcar::Vec<&'static str>,
-    /// One mutex per shard. The string's hash selects the shard so threads
-    /// colliding on the same shard serialize; everyone else proceeds in
-    /// parallel. Each is cache-line aligned (64 bytes) to avoid false sharing.
-    insert_shards: [PaddedMutex; N_SHARDS],
-}
-
-#[cfg(all(
-    feature = "interner",
-    not(feature = "lasso"),
-    not(feature = "symbol-table")
-))]
-static GLOBAL: std::sync::OnceLock<GlobalState> = std::sync::OnceLock::new();
-
-#[cfg(all(
-    feature = "interner",
-    not(feature = "lasso"),
-    not(feature = "symbol-table")
-))]
-fn global() -> &'static GlobalState {
-    GLOBAL.get_or_init(|| GlobalState {
-        forward: papaya::HashMap::new(),
-        reverse: boxcar::Vec::new(),
-        insert_shards: std::array::from_fn(|_| PaddedMutex(parking_lot::Mutex::new(()))),
-    })
-}
-
-#[cfg(all(
-    feature = "interner",
-    not(feature = "lasso"),
-    not(feature = "symbol-table")
-))]
-fn shard_for(s: &str) -> usize {
-    use std::collections::hash_map::RandomState;
-    use std::hash::BuildHasher;
-    use std::sync::OnceLock;
-    // Process-stable hasher so shard assignment is consistent.
-    static HASHER: OnceLock<RandomState> = OnceLock::new();
-    let hasher = HASHER.get_or_init(RandomState::new);
-    (hasher.hash_one(s) as usize) & (N_SHARDS - 1)
-}
-
-#[cfg(all(
-    feature = "interner",
-    not(feature = "lasso"),
-    not(feature = "symbol-table")
-))]
-impl Interner for GlobalInterner {
-    type Key = u32;
-
-    fn get_or_intern(s: &str) -> u32 {
-        let state = global();
-
-        // Fast path: lock-free read.
-        if let Some(&id) = state.forward.pin().get(s) {
-            return id;
+        fn global_lasso() -> &'static lasso::ThreadedRodeo {
+            GLOBAL_LASSO.get_or_init(lasso::ThreadedRodeo::default)
         }
 
-        // Slow path: lock just the shard this string hashes to.
-        let shard = shard_for(s);
-        let _guard = state.insert_shards[shard].0.lock();
-        let pinned = state.forward.pin();
-        if let Some(&id) = pinned.get(s) {
-            return id;
+        impl Interner for GlobalInterner {
+            type Key = u32;
+
+            fn get_or_intern(s: &str) -> u32 {
+                use lasso::Key as _;
+                global_lasso().get_or_intern(s).into_usize() as u32
+            }
+
+            fn resolve(key: &u32) -> &str {
+                use lasso::Key as _;
+                let spur = lasso::Spur::try_from_usize(*key as usize).expect("invalid interner key");
+                global_lasso().resolve(&spur)
+            }
         }
-        let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
-        let idx = state.reverse.push(leaked);
-        // The forward map stores u32 ids; truncating here would associate the
-        // new string with a stale id and silently corrupt later resolves.
-        // Lasso handles the analogous overflow with `KeySpaceExhaustion`;
-        // we panic since our trait doesn't surface an error path.
-        let id = u32::try_from(idx)
-            .expect("gentoo-interner: id space exhausted (more than u32::MAX unique strings)");
-        pinned.insert(leaked, id);
-        id
-    }
+    } else if #[cfg(feature = "symbol-table")] {
+        impl Interner for GlobalInterner {
+            type Key = u32;
 
-    fn resolve(key: &u32) -> &str {
-        global()
-            .reverse
-            .get(*key as usize)
-            .copied()
-            .expect("invalid interner key")
-    }
-}
+            fn get_or_intern(s: &str) -> u32 {
+                std::num::NonZeroU32::from(symbol_table::GlobalSymbol::from(s)).get()
+            }
 
-// ── symbol-table backend ──────────────────────────────────────────────────────
-//
-// `symbol_table::GlobalSymbol` is a process-wide interner backed by a
-// sharded `SymbolTable` (16 shards by default). Each shard holds a
-// `Mutex<HashMap>` and an arena allocator for the strings.
+            fn resolve(key: &u32) -> &str {
+                let sym = symbol_table::GlobalSymbol::from(
+                    std::num::NonZeroU32::new(*key).expect("invalid interner key (zero)"),
+                );
+                sym.as_str()
+            }
+        }
+    } else if #[cfg(feature = "interner")] {
+        //  * Fast path: lock-free `papaya` `get`, no allocation.
+        //  * Slow path: sharded mutexes (mirror `lasso::ThreadedRodeo`). The
+        //    string's hash picks one of `N_SHARDS` mutexes; only threads colliding
+        //    on the same shard contend. Inside the lock we re-check (a lock-free
+        //    reader may have missed us on the fast path), then allocate + push to
+        //    the reverse vec + use papaya's cheap `insert()`.
+        //  * Resolve: O(1) indexed read into a `boxcar::Vec<&'static str>`.
 
-#[cfg(all(feature = "symbol-table", not(feature = "lasso")))]
-impl Interner for GlobalInterner {
-    type Key = u32;
-
-    fn get_or_intern(s: &str) -> u32 {
-        std::num::NonZeroU32::from(symbol_table::GlobalSymbol::from(s)).get()
-    }
-
-    fn resolve(key: &u32) -> &str {
-        let sym = symbol_table::GlobalSymbol::from(
-            std::num::NonZeroU32::new(*key).expect("invalid interner key (zero)"),
+        const N_SHARDS: usize = 32;
+        const _: () = assert!(
+            N_SHARDS.is_power_of_two(),
+            "N_SHARDS must be a power of two for bitmask sharding to be correct",
         );
-        sym.as_str()
-    }
-}
 
-// ── lasso backend ─────────────────────────────────────────────────────────────
+        #[repr(align(64))]
+        struct PaddedMutex(parking_lot::Mutex<()>);
 
-#[cfg(feature = "lasso")]
-static GLOBAL_LASSO: std::sync::OnceLock<lasso::ThreadedRodeo> = std::sync::OnceLock::new();
+        struct GlobalState {
+            forward: papaya::HashMap<&'static str, u32>,
+            reverse: boxcar::Vec<&'static str>,
+            insert_shards: [PaddedMutex; N_SHARDS],
+        }
 
-#[cfg(feature = "lasso")]
-fn global_lasso() -> &'static lasso::ThreadedRodeo {
-    GLOBAL_LASSO.get_or_init(lasso::ThreadedRodeo::default)
-}
+        static GLOBAL: std::sync::OnceLock<GlobalState> = std::sync::OnceLock::new();
 
-#[cfg(feature = "lasso")]
-impl Interner for GlobalInterner {
-    type Key = u32;
+        fn global() -> &'static GlobalState {
+            GLOBAL.get_or_init(|| GlobalState {
+                forward: papaya::HashMap::new(),
+                reverse: boxcar::Vec::new(),
+                insert_shards: std::array::from_fn(|_| PaddedMutex(parking_lot::Mutex::new(()))),
+            })
+        }
 
-    fn get_or_intern(s: &str) -> u32 {
-        use lasso::Key as _;
-        global_lasso().get_or_intern(s).into_usize() as u32
-    }
+        fn shard_for(s: &str) -> usize {
+            use std::collections::hash_map::RandomState;
+            use std::hash::BuildHasher;
+            use std::sync::OnceLock;
+            static HASHER: OnceLock<RandomState> = OnceLock::new();
+            let hasher = HASHER.get_or_init(RandomState::new);
+            (hasher.hash_one(s) as usize) & (N_SHARDS - 1)
+        }
 
-    fn resolve(key: &u32) -> &str {
-        use lasso::Key as _;
-        let spur = lasso::Spur::try_from_usize(*key as usize).expect("invalid interner key");
-        global_lasso().resolve(&spur)
+        impl Interner for GlobalInterner {
+            type Key = u32;
+
+            fn get_or_intern(s: &str) -> u32 {
+                let state = global();
+                if let Some(&id) = state.forward.pin().get(s) {
+                    return id;
+                }
+                let shard = shard_for(s);
+                let _guard = state.insert_shards[shard].0.lock();
+                let pinned = state.forward.pin();
+                if let Some(&id) = pinned.get(s) {
+                    return id;
+                }
+                let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+                let idx = state.reverse.push(leaked);
+                let id = u32::try_from(idx)
+                    .expect("gentoo-interner: id space exhausted (more than u32::MAX unique strings)");
+                pinned.insert(leaked, id);
+                id
+            }
+
+            fn resolve(key: &u32) -> &str {
+                global()
+                    .reverse
+                    .get(*key as usize)
+                    .copied()
+                    .expect("invalid interner key")
+            }
+        }
     }
 }
 
@@ -521,9 +449,7 @@ mod tests {
         let pid = std::process::id();
 
         // Shared strings every thread interns
-        let shared: Vec<String> = (0..32)
-            .map(|i| format!("ct_shared_{pid}_{i}"))
-            .collect();
+        let shared: Vec<String> = (0..32).map(|i| format!("ct_shared_{pid}_{i}")).collect();
         let shared = Arc::new(shared);
 
         // Reference keys interned from the main thread first
@@ -540,10 +466,8 @@ mod tests {
                     let private: Vec<String> = (0..n_private)
                         .map(|i| format!("ct_priv_{pid}_t{t}_{i:08}"))
                         .collect();
-                    let private_keys: Vec<Interned<DefaultInterner>> = private
-                        .iter()
-                        .map(|s| Interned::intern(s))
-                        .collect();
+                    let private_keys: Vec<Interned<DefaultInterner>> =
+                        private.iter().map(|s| Interned::intern(s)).collect();
                     // Private roundtrip
                     for (k, s) in private_keys.iter().zip(private.iter()) {
                         assert_eq!(k.as_str(), s);
@@ -554,7 +478,7 @@ mod tests {
                         let expected = shared_keys
                             .iter()
                             .find(|sk| sk.as_str() == s)
-                            .copied()
+                            .cloned()
                             .expect("shared key not found");
                         assert_eq!(k, expected, "thread {t} got mismatched key for {s}");
                     }
