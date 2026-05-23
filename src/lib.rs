@@ -120,6 +120,14 @@ const _: () = assert!(
     not(feature = "lasso"),
     not(feature = "symbol-table")
 ))]
+#[repr(align(64))]
+struct PaddedMutex(parking_lot::Mutex<()>);
+
+#[cfg(all(
+    feature = "interner",
+    not(feature = "lasso"),
+    not(feature = "symbol-table")
+))]
 struct GlobalState {
     /// `str` → id. Keys are leaked so they are `'static`; lookups by
     /// `&str` work via the `Borrow<str>` impl on `&'static str`.
@@ -128,8 +136,8 @@ struct GlobalState {
     reverse: boxcar::Vec<&'static str>,
     /// One mutex per shard. The string's hash selects the shard so threads
     /// colliding on the same shard serialize; everyone else proceeds in
-    /// parallel. Cache-line padded to avoid false sharing.
-    insert_shards: [parking_lot::Mutex<()>; N_SHARDS],
+    /// parallel. Each is cache-line aligned (64 bytes) to avoid false sharing.
+    insert_shards: [PaddedMutex; N_SHARDS],
 }
 
 #[cfg(all(
@@ -148,7 +156,7 @@ fn global() -> &'static GlobalState {
     GLOBAL.get_or_init(|| GlobalState {
         forward: papaya::HashMap::new(),
         reverse: boxcar::Vec::new(),
-        insert_shards: std::array::from_fn(|_| parking_lot::Mutex::new(())),
+        insert_shards: std::array::from_fn(|_| PaddedMutex(parking_lot::Mutex::new(()))),
     })
 }
 
@@ -185,7 +193,7 @@ impl Interner for GlobalInterner {
 
         // Slow path: lock just the shard this string hashes to.
         let shard = shard_for(s);
-        let _guard = state.insert_shards[shard].lock();
+        let _guard = state.insert_shards[shard].0.lock();
         let pinned = state.forward.pin();
         if let Some(&id) = pinned.get(s) {
             return id;
