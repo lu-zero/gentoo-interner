@@ -17,6 +17,20 @@
 //! | `lasso` | `GlobalInterner` | `u32` | lasso-backed, arena alloc, `Copy` |
 //! | neither | `NoInterner` | `Box<str>` | No deduplication, `Clone` only |
 //!
+//! # Memory behavior
+//!
+//! **All interned strings are allocated once and live for the process lifetime.**
+//! The global interner has no deallocation path — each unique string passed to
+//! [`Interner::get_or_intern`] is allocated (or re-found) and retained forever.
+//! For the default (papaya) backend, this is a true `Box::leak`; for the lasso
+//! backend, strings live in an arena behind a `OnceLock` that is never dropped.
+//!
+//! This is a deliberate trade-off: it enables `Interned<GlobalInterner>` to be
+//! `Copy` (4 bytes) with O(1) resolution. For typical Gentoo workloads
+//! (~200k unique atoms), leaked memory is on the order of 10–20 MB.
+//!
+//! If bounded memory is required, consider a scoped/local interner instead.
+//!
 //! # Example
 //!
 //! ```
@@ -48,7 +62,9 @@ pub trait Interner: Clone + Send + Sync + 'static {
 /// Non-interning fallback that allocates each string as a `Box<str>`.
 ///
 /// No deduplication occurs. The [`Key`](Interner::Key) type is `Box<str>`,
-/// making `Interned<NoInterner>` `Clone` but not `Copy`.
+/// making `Interned<NoInterner>` `Clone` but not `Copy`. Unlike
+/// [`GlobalInterner`], strings are freed when their `Interned` handle is
+/// dropped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoInterner;
 
@@ -73,6 +89,12 @@ impl Interner for NoInterner {
 ///   [`boxcar::Vec`] for indexed `resolve`, with a global `Mutex` gating
 ///   inserts so the slow path never wastes allocations on races.
 /// - `lasso`: `lasso::ThreadedRodeo` arena; enable for benchmarking.
+///
+/// # Memory
+///
+/// All interned strings are allocated once and retained for the process
+/// lifetime. There is no deallocation path. See the [crate-level
+/// documentation](crate#memory-behavior) for details.
 #[cfg(any(feature = "interner", feature = "lasso", feature = "symbol-table"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlobalInterner;

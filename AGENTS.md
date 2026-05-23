@@ -15,15 +15,21 @@ cargo doc --no-deps               # Build docs — must have no warnings
 - Public API: `Interner` trait, `Interned<I>` wrapper, `GlobalInterner`, `NoInterner`, `DefaultInterner`
 - `Interner` trait uses static methods; `Interned<I>` carries `PhantomData<I>`
 - Feature-gated implementations:
-  - `interner` feature (default): `GlobalInterner` using `lasso`
-  - No `interner`: `NoInterner` using `Box<str>`
+  - `interner` feature (default): `GlobalInterner` using papaya + boxcar + sharded mutexes
+  - `lasso`: `GlobalInterner` using `lasso::ThreadedRodeo` (benchmarking only)
+  - `symbol-table`: `GlobalInterner` using `symbol_table::GlobalSymbol` (benchmarking only)
+  - No features: `NoInterner` using `Box<str>` (no deduplication)
 
 ## Dependencies
 
 Minimal. Any new dependency must be justified.
 
 Current dependencies:
-- `lasso` (multi-threaded feature, optional) — string interning; gated behind `interner` feature
+- `papaya` (optional) — lock-free HashMap for the default interner backend
+- `boxcar` (optional) — concurrent Vec for O(1) resolve in the default backend
+- `parking_lot` (optional) — sharded mutexes for the default backend slow path
+- `lasso` (multi-threaded feature, optional) — alternative interner backend; benchmarking
+- `symbol_table` (global feature, optional) — alternative interner backend; benchmarking
 - `serde` (optional) — serialization support
 
 ## Coding Style

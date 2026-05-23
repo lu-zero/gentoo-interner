@@ -40,7 +40,7 @@ flag names).
 
 ### Help wanted: testing and review
 
-This backend is new in 0.2.1 and the multi-threaded soundness deserves
+This backend was new in 0.2 and the multi-threaded soundness deserves
 extra scrutiny. The relevant invariants are:
 
 1. A `u32` id observed via the forward map must always resolve in the
@@ -156,7 +156,7 @@ feature-flagged alternatives for workload-specific tuning.
 
 ```toml
 [dependencies]
-gentoo-interner = "0.2"
+gentoo-interner = "0.3"
 ```
 
 ## Usage
@@ -181,6 +181,11 @@ assert_eq!(a, b); // Same key, cheap equality
 | `serde` | No | Serde serialization |
 
 [`symbol_table::GlobalSymbol`]: https://docs.rs/symbol_table
+
+## Breaking changes in 0.3
+
+- `Interner::Key` now requires `Ord`.
+- `Interned<I>` now implements `Ord`/`PartialOrd` (by key value).
 
 ## Breaking changes in 0.2
 
